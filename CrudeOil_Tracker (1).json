@@ -1,0 +1,1532 @@
+{
+  "name": "CrudeOil_Tracker",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -432,
+        4976
+      ],
+      "id": "ab2ab989-bad2-4961-8ce7-2effde43ecc2",
+      "name": "Manual Trigger"
+    },
+    {
+      "parameters": {
+        "url": "https://api.tastyworks.com/instruments/futures",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "product-code",
+              "value": "CL"
+            },
+            {
+              "name": "only-active-futures",
+              "value": "true"
+            },
+            {
+              "name": "per-page",
+              "value": "1000"
+            },
+            {
+              "name": "page-offset",
+              "value": "0"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('Get Tastytrade Access Token4').item.json.access_token }}"
+            },
+            {
+              "name": "User-Agent",
+              "value": "crude-daily-sheet/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -112,
+        3808
+      ],
+      "id": "bad511ef-8e95-46c4-9bbf-c3483add9fa5",
+      "name": "Get All Listed CL Contracts1",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const futures = $json?.data?.items ?? [];\n\nif (!Array.isArray(futures) || futures.length === 0) {\n  throw new Error('Tastytrade returned no listed CL futures contracts');\n}\n\nconst contracts = futures\n  .filter(contract => contract.symbol?.startsWith('/CL'))\n  .sort((a, b) => String(a['expiration-date']).localeCompare(String(b['expiration-date'])))\n  .map(contract => ({\n    symbol: contract.symbol,\n    expiration_date: contract['expiration-date'] ?? '',\n    active_month: contract['active-month'] === true,\n    next_active_month: contract['next-active-month'] === true,\n    is_tradeable: contract['is-tradeable'] !== false,\n    is_closing_only: contract['is-closing-only'] === true\n  }));\n\nif (contracts.length === 0) {\n  throw new Error('No /CL contracts remained after filtering');\n}\n\nconst BATCH_SIZE = 90;\nconst batches = [];\n\nfor (let index = 0; index < contracts.length; index += BATCH_SIZE) {\n  const batchContracts = contracts.slice(index, index + BATCH_SIZE);\n  batches.push({\n    json: {\n      batch_number: Math.floor(index / BATCH_SIZE) + 1,\n      total_contracts: contracts.length,\n      symbols_csv: batchContracts.map(contract => contract.symbol).join(','),\n      contracts: batchContracts\n    }\n  });\n}\n\nreturn batches;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        128,
+        3808
+      ],
+      "id": "6205bcbb-7b2e-4875-9a4e-473cab9a0173",
+      "name": "Prepare CL Contract Batches1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const responses = $input.all();\nconst batches = $('Prepare CL Contract Batches1').all();\n\nconst marketBySymbol = new Map();\nconst contractBySymbol = new Map();\n\nfor (const batch of batches) {\n  for (const contract of batch.json.contracts ?? []) {\n    contractBySymbol.set(contract.symbol, contract);\n  }\n}\n\nfor (const response of responses) {\n  const marketItems = response.json?.data?.items ?? [];\n  for (const market of marketItems) {\n    if (market?.symbol) marketBySymbol.set(market.symbol, market);\n  }\n}\n\nconst summaryDates = [...marketBySymbol.values()]\n  .map(market => market['summary-date'])\n  .filter(Boolean)\n  .sort();\n\nconst fallbackTradeDate = summaryDates.at(-1) ?? new Intl.DateTimeFormat('en-CA', {\n  timeZone: 'America/New_York',\n  year: 'numeric',\n  month: '2-digit',\n  day: '2-digit'\n}).format(new Date());\n\nconst numberOrBlank = value => {\n  if (value === null || value === undefined || value === '') return '';\n  const parsed = Number(value);\n  return Number.isFinite(parsed) ? parsed : '';\n};\n\nconst rows = [];\n\nfor (const contract of [...contractBySymbol.values()].sort((a, b) =>\n  String(a.expiration_date).localeCompare(String(b.expiration_date))\n)) {\n  const market = marketBySymbol.get(contract.symbol);\n  const high = market?.['day-high-price'] ?? market?.['day-high'];\n  const low = market?.['day-low-price'] ?? market?.['day-low'];\n  const tradeDate = market?.['summary-date'] ?? fallbackTradeDate;\n\n  let dataStatus = 'OK';\n  if (!market) dataStatus = 'NO_MARKET_DATA';\n  else if (high === null || high === undefined || low === null || low === undefined) dataStatus = 'NO_TRADES';\n\n  rows.push({\n    json: {\n      unique_key: `${tradeDate}|${contract.symbol}`,\n      trade_date: tradeDate,\n      root_symbol: '/CL',\n      contract_symbol: contract.symbol,\n      expiration_date: contract.expiration_date,\n      active_month: contract.active_month ? 'YES' : 'NO',\n      next_active_month: contract.next_active_month ? 'YES' : 'NO',\n      data_status: dataStatus,\n      day_high: numberOrBlank(high),\n      day_low: numberOrBlank(low),\n      open: numberOrBlank(market?.open ?? market?.['day-open']),\n      close: numberOrBlank(market?.close ?? market?.['day-close']),\n      last: numberOrBlank(market?.last),\n      bid: numberOrBlank(market?.bid),\n      ask: numberOrBlank(market?.ask),\n      mark: numberOrBlank(market?.mark),\n      volume: numberOrBlank(market?.volume),\n      source_updated_at: market?.['updated-at'] ?? '',\n      fetched_at_utc: new Date().toISOString()\n    }\n  });\n}\n\nif (rows.length === 0) {\n  throw new Error('No CL contract rows were produced');\n}\n\nreturn rows;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        3808
+      ],
+      "id": "366b5403-cd66-4ec0-a992-cfda7d0b5485",
+      "name": "Normalize All Contract Rows1"
+    },
+    {
+      "parameters": {
+        "url": "https://api.tastyworks.com/market-data/by-type",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "future",
+              "value": "={{ $json.symbols_csv }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('Get Tastytrade Access Token4').item.json.access_token }}"
+            },
+            {
+              "name": "User-Agent",
+              "value": "crude-daily-sheet/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        368,
+        3808
+      ],
+      "id": "29a8f6f6-8e00-4c0e-a57d-856a58ae262d",
+      "name": "Get Daily Market Data3",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.tastyworks.com/oauth/token",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "crude-daily-sheet/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "refresh_token"
+            },
+            {
+              "name": "refresh_token",
+              "value": "eyJhbGciOiJFZERTQSIsInR5cCI6InJ0K2p3dCIsImtpZCI6InRPTEVrUk9yUzROWG9jU0c5azA3cXVIUnl5TnVYZ0UtTDVjZmtHclFsZU0iLCJqa3UiOiJodHRwczovL2FwaS50YXN0eXRyYWRlLmNvbS9vYXV0aC9qd2tzIn0.eyJpc3MiOiJodHRwczovL2FwaS50YXN0eXRyYWRlLmNvbSIsInN1YiI6IlViMTNjZDZjNC1iYjUzLTRmNDEtYWExMy1hZWNjZmJlZDM3YTIiLCJpYXQiOjE3ODc3NDYyNTMsImF1ZCI6ImE5OGY4ZTA5LTEyZGEtNDA3YS05MmI1LTE1NDIzN2MxMGMwZiIsImdyYW50X2lkIjoiRzhmYjBmYjc0LTllYTQtNDE4ZC04NWMzLTE5MTNmMjUzMTc2NyIsInNjb3BlIjoicmVhZCBvcGVuaWQifQ.qGm-FJ1CtjblyjTjL_RNpTOodeiTHVN41cBTvNmD4BPeP6tBA0fBKqmhj3oWHPWReqSI-zUjxrGJcb7abzwyAA"
+            },
+            {
+              "name": "client_secret",
+              "value": "2969684682c51420608952dca257132db780802f"
+            },
+            {
+              "name": "client_id",
+              "value": "a98f8e09-12da-407a-92b5-154237c10c0f"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -320,
+        3808
+      ],
+      "id": "4d826ee2-e127-4b7a-ab7a-be6ff9a8bee7",
+      "name": "Get Tastytrade Access Token4",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        336,
+        4304
+      ],
+      "id": "42037d8d-9bdb-4931-858c-fc5debba55c0",
+      "name": "Loop Over Historical Batches"
+    },
+    {
+      "parameters": {
+        "command": "=node \"C:\\Users\\Citrisys\\Documents\\Codex\\2026-08-26\\dai-2\\tastytrade-history\\fetch-cl-history-batch.mjs\" \"{{$json.batch_base64}}\""
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        560,
+        4432
+      ],
+      "id": "e6dbe678-ec08-4f47-a34d-9bc5989bc778",
+      "name": "Fetch One Historical Batch"
+    },
+    {
+      "parameters": {
+        "fileSelector": "={{ JSON.parse($json.stdout.trim()).file_path }}",
+        "options": {
+          "dataPropertyName": "data"
+        }
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        784,
+        4432
+      ],
+      "id": "3eaf10a6-a01f-4eff-aaa9-3d6e1d6cab6a",
+      "name": "Read Historical Batch File"
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "destinationKey": "rows",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        1008,
+        4432
+      ],
+      "id": "c158dc32-0a62-49e8-9cf9-ae0a321deecf",
+      "name": "Extract Historical JSON"
+    },
+    {
+      "parameters": {
+        "jsCode": "const output = [];\nconst seen = new Set();\n\nconst isValidNumber = (value) => {\n  if (value === null || value === undefined || value === '') return false;\n  return Number.isFinite(Number(value));\n};\n\nfor (const item of $input.all()) {\n  const rows = item.json.rows;\n\n  if (!Array.isArray(rows)) {\n    throw new Error('Extracted historical data is not an array');\n  }\n\n  for (const row of rows) {\n    const hasCompleteOHLC = [\n      row.open,\n      row.day_high,\n      row.day_low,\n      row.close\n    ].every(isValidNumber);\n\n    if (!hasCompleteOHLC) continue;\n    if (!row.unique_key || seen.has(row.unique_key)) continue;\n\n    seen.add(row.unique_key);\n    output.push({ json: row });\n  }\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1232,
+        4432
+      ],
+      "id": "686a98b0-e0ba-4677-8295-79277594e83b",
+      "name": "Keep Complete Historical OHLC Rows"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1CA__c8JlDXIzW54pAkAX2kzvIoLXQ0HcylStzeGhEbk",
+          "mode": "list",
+          "cachedResultName": "Crude Oil Price",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1CA__c8JlDXIzW54pAkAX2kzvIoLXQ0HcylStzeGhEbk/edit"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1CA__c8JlDXIzW54pAkAX2kzvIoLXQ0HcylStzeGhEbk/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Unique Key": "={{ $json.unique_key }}",
+            "Symbol": "={{ $json.contract_symbol }}",
+            "High Price": "={{ $json.day_high }}",
+            "Low Price": "={{ $json.day_low }}",
+            "Starting Price": "={{ $json.open }}",
+            "Ending Price": "={{ $json.close }}",
+            "Logged Time": "={{ $json.fetched_at_utc }}",
+            "Trade Date": "={{ $json.trade_date }}",
+            "Expiration Date": "={{ $json.expiration_date }}",
+            "Active Month": "={{ $json.active_month }}",
+            "Next Active Month": "={{ $json.next_active_month }}",
+            "Data Status": "={{ $json.data_status }}",
+            "Last Price": "={{ $json.last }}",
+            "Volume": "={{ $json.volume }}",
+            "Source Updated At": "={{ $json.source_updated_at }}"
+          },
+          "matchingColumns": [
+            "Unique Key"
+          ],
+          "schema": [
+            {
+              "id": "Unique Key",
+              "displayName": "Unique Key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Symbol",
+              "displayName": "Symbol",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "High Price",
+              "displayName": "High Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Low Price",
+              "displayName": "Low Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Starting Price",
+              "displayName": "Starting Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Ending Price",
+              "displayName": "Ending Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Logged Time",
+              "displayName": "Logged Time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Trade Date",
+              "displayName": "Trade Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Expiration Date",
+              "displayName": "Expiration Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Active Month",
+              "displayName": "Active Month",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Next Active Month",
+              "displayName": "Next Active Month",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Data Status",
+              "displayName": "Data Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Last Price",
+              "displayName": "Last Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Volume",
+              "displayName": "Volume",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Source Updated At",
+              "displayName": "Source Updated At",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1456,
+        4432
+      ],
+      "id": "574e608c-dddd-47d3-af0e-d810566d1da0",
+      "name": "Upsert Historical Rows",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "QJwj6WlVAp3YxG5x",
+          "name": "Google Sheets account 6"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const futures = $json?.data?.items ?? [];\n\nif (!Array.isArray(futures) || futures.length === 0) {\n  throw new Error('No listed CL contracts returned');\n}\n\nconst BATCH_SIZE = 10;\nconst fromTime = 1_000_000_000;\n\nconst contracts = futures\n  .filter(contract =>\n    contract.symbol?.startsWith('/CL') &&\n    contract['streamer-symbol'] &&\n    contract['is-tradeable'] !== false\n  )\n  .sort((a, b) =>\n    String(a['expiration-date'] ?? '')\n      .localeCompare(String(b['expiration-date'] ?? ''))\n  )\n  .map(contract => ({\n    contract_symbol: contract.symbol,\n    streamer_symbol: contract['streamer-symbol'],\n    expiration_date: contract['expiration-date'] ?? '',\n    active_month: contract['active-month'] === true ? 'YES' : 'NO',\n    next_active_month: contract['next-active-month'] === true ? 'YES' : 'NO'\n  }));\n\nif (contracts.length === 0) {\n  throw new Error('No CL contracts with streamer symbols were found');\n}\n\nconst totalBatches = Math.ceil(contracts.length / BATCH_SIZE);\nconst output = [];\n\nfor (let index = 0; index < contracts.length; index += BATCH_SIZE) {\n  const batchContracts = contracts.slice(index, index + BATCH_SIZE);\n  const batchNumber = Math.floor(index / BATCH_SIZE) + 1;\n\n  const request = {\n    batch_number: batchNumber,\n    from_time: fromTime,\n    history_mode: 'MAX_AVAILABLE',\n    contracts: batchContracts\n  };\n\n  output.push({\n    json: {\n      batch_number: batchNumber,\n      total_batches: totalBatches,\n      total_contracts: contracts.length,\n      contracts_in_batch: batchContracts.length,\n      history_mode: 'MAX_AVAILABLE',\n      from_time: fromTime,\n      batch_base64: Buffer\n        .from(JSON.stringify(request), 'utf8')\n        .toString('base64url')\n    }\n  });\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        112,
+        4304
+      ],
+      "id": "6684957b-5c10-453a-9d3f-2e13b3ca614d",
+      "name": "Prepare Historical Contract Batches1"
+    },
+    {
+      "parameters": {
+        "url": "https://api.tastyworks.com/instruments/futures",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "product-code",
+              "value": "CL"
+            },
+            {
+              "name": "only-active-futures",
+              "value": "true"
+            },
+            {
+              "name": "per-page",
+              "value": "1000"
+            },
+            {
+              "name": "page-offset",
+              "value": "0"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('Get Tastytrade Access Token5').item.json.access_token }}"
+            },
+            {
+              "name": "User-Agent",
+              "value": "crude-daily-sheet/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -112,
+        4304
+      ],
+      "id": "42d8ebae-e9b1-4376-8c52-66b0dfc0e90d",
+      "name": "Get All Listed CL Contracts2",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.tastyworks.com/oauth/token",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "crude-daily-sheet/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "refresh_token"
+            },
+            {
+              "name": "refresh_token",
+              "value": "eyJhbGciOiJFZERTQSIsInR5cCI6InJ0K2p3dCIsImtpZCI6InRPTEVrUk9yUzROWG9jU0c5azA3cXVIUnl5TnVYZ0UtTDVjZmtHclFsZU0iLCJqa3UiOiJodHRwczovL2FwaS50YXN0eXRyYWRlLmNvbS9vYXV0aC9qd2tzIn0.eyJpc3MiOiJodHRwczovL2FwaS50YXN0eXRyYWRlLmNvbSIsInN1YiI6IlViMTNjZDZjNC1iYjUzLTRmNDEtYWExMy1hZWNjZmJlZDM3YTIiLCJpYXQiOjE3ODc3NDYyNTMsImF1ZCI6ImE5OGY4ZTA5LTEyZGEtNDA3YS05MmI1LTE1NDIzN2MxMGMwZiIsImdyYW50X2lkIjoiRzhmYjBmYjc0LTllYTQtNDE4ZC04NWMzLTE5MTNmMjUzMTc2NyIsInNjb3BlIjoicmVhZCBvcGVuaWQifQ.qGm-FJ1CtjblyjTjL_RNpTOodeiTHVN41cBTvNmD4BPeP6tBA0fBKqmhj3oWHPWReqSI-zUjxrGJcb7abzwyAA"
+            },
+            {
+              "name": "client_secret",
+              "value": "2969684682c51420608952dca257132db780802f"
+            },
+            {
+              "name": "client_id",
+              "value": "a98f8e09-12da-407a-92b5-154237c10c0f"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -336,
+        4304
+      ],
+      "id": "07f178b2-ced0-4bc2-9601-8caeb6ecc085",
+      "name": "Get Tastytrade Access Token5",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "content": "Crude Oil Daily Fetching workflow",
+        "height": 80,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -320,
+        3696
+      ],
+      "id": "aecc0bab-c4e3-4fd3-8c6a-12853365441d",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "Crude Oil Historical Data Fetching Workflow",
+        "height": 80,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -336,
+        4160
+      ],
+      "id": "463c17d1-536d-4bcb-b292-8936778c082b",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1FUdeDiJo4REobaqZNWjIy7cjg6R5pokOoCB6gnOPpwM",
+          "mode": "list",
+          "cachedResultName": "Curde Oil Daily Fetching",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1FUdeDiJo4REobaqZNWjIy7cjg6R5pokOoCB6gnOPpwM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1FUdeDiJo4REobaqZNWjIy7cjg6R5pokOoCB6gnOPpwM/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Unique Key": "={{ $json.unique_key }}",
+            "Symbol": "={{ $json.root_symbol }}",
+            "High Price": "={{ $json.day_high }}",
+            "Low Price": "={{ $json.day_low }}",
+            "Starting Price": "={{ $json.open }}",
+            "Ending Price": "={{ $json.close }}",
+            "Last Price": "={{ $json.last }}",
+            "Volume": "={{ $json.volume }}",
+            "Source Updated At": "={{ $json.source_updated_at }}",
+            "Expiration Date": "={{ $json.expiration_date }}",
+            "Next Active Month": "={{ $json.next_active_month }}",
+            "Active Month": "={{ $json.active_month }}",
+            "Trade Date": "={{ $json.trade_date }}",
+            "Data Status": "={{ $json.data_status }}",
+            "Logged Time": "={{ $json.fetched_at_utc }}"
+          },
+          "matchingColumns": [
+            "Unique Key"
+          ],
+          "schema": [
+            {
+              "id": "Unique Key",
+              "displayName": "Unique Key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Symbol",
+              "displayName": "Symbol",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "High Price",
+              "displayName": "High Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Low Price",
+              "displayName": "Low Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Starting Price",
+              "displayName": "Starting Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Ending Price",
+              "displayName": "Ending Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Logged Time",
+              "displayName": "Logged Time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Trade Date",
+              "displayName": "Trade Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Expiration Date",
+              "displayName": "Expiration Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Active Month",
+              "displayName": "Active Month",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Next Active Month",
+              "displayName": "Next Active Month",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Data Status",
+              "displayName": "Data Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Last Price",
+              "displayName": "Last Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Volume",
+              "displayName": "Volume",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Source Updated At",
+              "displayName": "Source Updated At",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        880,
+        3808
+      ],
+      "id": "17ae1ad8-10f2-40e6-972a-fb48f295a5a8",
+      "name": "Upsert Historical Rows1",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "QJwj6WlVAp3YxG5x",
+          "name": "Google Sheets account 6"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const futures = $json?.data?.items ?? [];\n\nif (!Array.isArray(futures) || futures.length === 0) {\n  throw new Error('No listed CL contracts returned');\n}\n\nconst DAYS_BACK = 7;\nconst DAY_MS = 24 * 60 * 60 * 1000;\nconst BATCH_SIZE = 10;\nconst now = new Date();\n\n// Use UTC midnight boundaries so this fetches seven complete candle dates.\n// Example: when run on Sep 1 UTC, the range is Aug 25 through Aug 31.\nconst toTime = Date.UTC(\n  now.getUTCFullYear(),\n  now.getUTCMonth(),\n  now.getUTCDate()\n);\nconst fromTime = toTime - DAYS_BACK * DAY_MS;\n\nconst contracts = futures\n  .filter(contract =>\n    contract.symbol?.startsWith('/CL') &&\n    contract['streamer-symbol'] &&\n    contract['is-tradeable'] !== false\n  )\n  .sort((a, b) =>\n    String(a['expiration-date'] ?? '')\n      .localeCompare(String(b['expiration-date'] ?? ''))\n  )\n  .map(contract => ({\n    contract_symbol: contract.symbol,\n    streamer_symbol: contract['streamer-symbol'],\n    expiration_date: contract['expiration-date'] ?? '',\n    active_month: contract['active-month'] === true ? 'YES' : 'NO',\n    next_active_month: contract['next-active-month'] === true ? 'YES' : 'NO'\n  }));\n\nif (contracts.length === 0) {\n  throw new Error('No CL contracts with streamer symbols were found');\n}\n\nconst totalBatches = Math.ceil(contracts.length / BATCH_SIZE);\nconst output = [];\n\nfor (let index = 0; index < contracts.length; index += BATCH_SIZE) {\n  const batchContracts = contracts.slice(index, index + BATCH_SIZE);\n  const batchNumber = Math.floor(index / BATCH_SIZE) + 1;\n\n  const request = {\n    batch_number: batchNumber,\n    from_time: fromTime,\n    to_time: toTime,\n    days_back: DAYS_BACK,\n    history_mode: 'LAST_7_COMPLETED_UTC_DAYS',\n    contracts: batchContracts\n  };\n\n  output.push({\n    json: {\n      batch_number: batchNumber,\n      total_batches: totalBatches,\n      total_contracts: contracts.length,\n      contracts_in_batch: batchContracts.length,\n      from_time: fromTime,\n      to_time: toTime,\n      start_date_utc: new Date(fromTime).toISOString().slice(0, 10),\n      end_date_utc: new Date(toTime - DAY_MS).toISOString().slice(0, 10),\n      batch_base64: Buffer\n        .from(JSON.stringify(request), 'utf8')\n        .toString('base64url')\n    }\n  });\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        4976
+      ],
+      "id": "908bb93f-c2b9-43f8-85ed-781f04ad673a",
+      "name": "Prepare Last Week Contract Batches"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        416,
+        4976
+      ],
+      "id": "846c1943-1f91-4f49-8bea-f373ce073540",
+      "name": "Loop Over Last Week Batches"
+    },
+    {
+      "parameters": {
+        "command": "=node \"C:\\Users\\Citrisys\\Documents\\Codex\\2026-08-26\\dai-2\\tastytrade-history\\fetch-cl-history-batch.mjs\" \"{{$json.batch_base64}}\""
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        640,
+        5104
+      ],
+      "id": "95d14989-6e26-483f-a02f-3bd6a5188ab6",
+      "name": "Fetch One Last Week Batch",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "fileSelector": "={{ JSON.parse($json.stdout.trim()).file_path }}",
+        "options": {
+          "dataPropertyName": "data"
+        }
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        864,
+        5104
+      ],
+      "id": "2c4b792d-20b6-4b72-81dc-8f3e8e53d985",
+      "name": "Read Last Week Batch File"
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "destinationKey": "rows",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        1088,
+        5104
+      ],
+      "id": "354709b9-ade0-4c23-87b7-36af9d0dbff7",
+      "name": "Extract Last Week JSON"
+    },
+    {
+      "parameters": {
+        "jsCode": "const output = [];\nconst seen = new Set();\n\nconst isValidNumber = (value) => {\n  if (value === null || value === undefined || value === '') return false;\n  return Number.isFinite(Number(value));\n};\n\nfor (const item of $input.all()) {\n  const rows = item.json.rows;\n\n  if (!Array.isArray(rows)) {\n    throw new Error('Extracted last-week data is not an array');\n  }\n\n  for (const row of rows) {\n    const hasCompleteOHLC = [\n      row.open,\n      row.day_high,\n      row.day_low,\n      row.close\n    ].every(isValidNumber);\n\n    if (!hasCompleteOHLC) continue;\n    if (!row.unique_key || seen.has(row.unique_key)) continue;\n\n    seen.add(row.unique_key);\n    output.push({ json: row });\n  }\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1312,
+        5104
+      ],
+      "id": "5446e35f-51ae-4af6-8f62-cba9b4f7fa38",
+      "name": "Keep Complete Last Week OHLC Rows"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1s6XCffg6D7zaU2hsSC0SSjTMfwBpvLYTcNJtaf7Ua9c",
+          "mode": "list",
+          "cachedResultName": "Crude Oil Week Data Fetching",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1s6XCffg6D7zaU2hsSC0SSjTMfwBpvLYTcNJtaf7Ua9c/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1FUdeDiJo4REobaqZNWjIy7cjg6R5pokOoCB6gnOPpwM/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Unique Key": "={{ $json.unique_key }}",
+            "Symbol": "={{ $json.contract_symbol }}",
+            "High Price": "={{ $json.day_high }}",
+            "Low Price": "={{ $json.day_low }}",
+            "Starting Price": "={{ $json.open }}",
+            "Ending Price": "={{ $json.close }}",
+            "Logged Time": "={{ $json.fetched_at_utc }}",
+            "Trade Date": "={{ $json.trade_date }}",
+            "Expiration Date": "={{ $json.expiration_date }}",
+            "Active Month": "={{ $json.active_month }}",
+            "Next Active Month": "={{ $json.next_active_month }}",
+            "Data Status": "={{ $json.data_status }}",
+            "Last Price": "={{ $json.last }}",
+            "Volume": "={{ $json.volume }}",
+            "Source Updated At": "={{ $json.source_updated_at }}"
+          },
+          "matchingColumns": [
+            "Unique Key"
+          ],
+          "schema": [
+            {
+              "id": "Unique Key",
+              "displayName": "Unique Key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Symbol",
+              "displayName": "Symbol",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "High Price",
+              "displayName": "High Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Low Price",
+              "displayName": "Low Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Starting Price",
+              "displayName": "Starting Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Ending Price",
+              "displayName": "Ending Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Logged Time",
+              "displayName": "Logged Time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Trade Date",
+              "displayName": "Trade Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Expiration Date",
+              "displayName": "Expiration Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Active Month",
+              "displayName": "Active Month",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Next Active Month",
+              "displayName": "Next Active Month",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Data Status",
+              "displayName": "Data Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Last Price",
+              "displayName": "Last Price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Volume",
+              "displayName": "Volume",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Source Updated At",
+              "displayName": "Source Updated At",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1536,
+        5104
+      ],
+      "id": "417ae19e-5298-4874-8cb1-27f77fb18953",
+      "name": "Upsert Last Week Rows",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "QJwj6WlVAp3YxG5x",
+          "name": "Google Sheets account 6"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://api.tastyworks.com/instruments/futures",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "product-code",
+              "value": "CL"
+            },
+            {
+              "name": "only-active-futures",
+              "value": "true"
+            },
+            {
+              "name": "per-page",
+              "value": "1000"
+            },
+            {
+              "name": "page-offset",
+              "value": "0"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('Get Tastytrade Access Token2').item.json.access_token }}"
+            },
+            {
+              "name": "User-Agent",
+              "value": "crude-daily-sheet/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        4976
+      ],
+      "id": "a3d1ae83-3ce6-4794-8b48-f834172e8f98",
+      "name": "Get All Listed CL Contracts4",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.tastyworks.com/oauth/token",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "crude-daily-sheet/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "refresh_token"
+            },
+            {
+              "name": "refresh_token",
+              "value": "eyJhbGciOiJFZERTQSIsInR5cCI6InJ0K2p3dCIsImtpZCI6InRPTEVrUk9yUzROWG9jU0c5azA3cXVIUnl5TnVYZ0UtTDVjZmtHclFsZU0iLCJqa3UiOiJodHRwczovL2FwaS50YXN0eXRyYWRlLmNvbS9vYXV0aC9qd2tzIn0.eyJpc3MiOiJodHRwczovL2FwaS50YXN0eXRyYWRlLmNvbSIsInN1YiI6IlViMTNjZDZjNC1iYjUzLTRmNDEtYWExMy1hZWNjZmJlZDM3YTIiLCJpYXQiOjE3ODc3NDYyNTMsImF1ZCI6ImE5OGY4ZTA5LTEyZGEtNDA3YS05MmI1LTE1NDIzN2MxMGMwZiIsImdyYW50X2lkIjoiRzhmYjBmYjc0LTllYTQtNDE4ZC04NWMzLTE5MTNmMjUzMTc2NyIsInNjb3BlIjoicmVhZCBvcGVuaWQifQ.qGm-FJ1CtjblyjTjL_RNpTOodeiTHVN41cBTvNmD4BPeP6tBA0fBKqmhj3oWHPWReqSI-zUjxrGJcb7abzwyAA"
+            },
+            {
+              "name": "client_secret",
+              "value": "2969684682c51420608952dca257132db780802f"
+            },
+            {
+              "name": "client_id",
+              "value": "a98f8e09-12da-407a-92b5-154237c10c0f"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -208,
+        4976
+      ],
+      "id": "cf6f19a1-de49-4df6-92f7-b815b7837d29",
+      "name": "Get Tastytrade Access Token2",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "content": "Crude Oil weekly data fetching\n",
+        "height": 80
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -432,
+        4848
+      ],
+      "id": "ba1499df-10b3-4eda-b929-30c36ffbad40",
+      "name": "Sticky Note2"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Tastytrade Access Token2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get All Listed CL Contracts1": {
+      "main": [
+        [
+          {
+            "node": "Prepare CL Contract Batches1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare CL Contract Batches1": {
+      "main": [
+        [
+          {
+            "node": "Get Daily Market Data3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize All Contract Rows1": {
+      "main": [
+        [
+          {
+            "node": "Upsert Historical Rows1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Daily Market Data3": {
+      "main": [
+        [
+          {
+            "node": "Normalize All Contract Rows1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Tastytrade Access Token4": {
+      "main": [
+        [
+          {
+            "node": "Get All Listed CL Contracts1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Historical Batches": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Fetch One Historical Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch One Historical Batch": {
+      "main": [
+        [
+          {
+            "node": "Read Historical Batch File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Historical Batch File": {
+      "main": [
+        [
+          {
+            "node": "Extract Historical JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Historical JSON": {
+      "main": [
+        [
+          {
+            "node": "Keep Complete Historical OHLC Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keep Complete Historical OHLC Rows": {
+      "main": [
+        [
+          {
+            "node": "Upsert Historical Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Historical Rows": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Historical Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Historical Contract Batches1": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Historical Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Tastytrade Access Token5": {
+      "main": [
+        [
+          {
+            "node": "Get All Listed CL Contracts2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get All Listed CL Contracts2": {
+      "main": [
+        [
+          {
+            "node": "Prepare Historical Contract Batches1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Last Week Contract Batches": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Last Week Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Last Week Batches": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Fetch One Last Week Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch One Last Week Batch": {
+      "main": [
+        [
+          {
+            "node": "Read Last Week Batch File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Last Week Batch File": {
+      "main": [
+        [
+          {
+            "node": "Extract Last Week JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Last Week JSON": {
+      "main": [
+        [
+          {
+            "node": "Keep Complete Last Week OHLC Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keep Complete Last Week OHLC Rows": {
+      "main": [
+        [
+          {
+            "node": "Upsert Last Week Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Last Week Rows": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Last Week Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Tastytrade Access Token2": {
+      "main": [
+        [
+          {
+            "node": "Get All Listed CL Contracts4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get All Listed CL Contracts4": {
+      "main": [
+        [
+          {
+            "node": "Prepare Last Week Contract Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "b4163c1b-d0e0-4540-bb5c-92c77ecc1745",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "2c31ff129e343fac3c88d4740cc09ecaa52b8305289c8bd600696d45dc7e4015"
+  },
+  "id": "2CM2ICtBRhL2zaoY",
+  "tags": []
+}
